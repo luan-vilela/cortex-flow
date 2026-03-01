@@ -1,0 +1,89 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: cortex-flow-api
+    ports:
+      - "3002:3000"
+    environment:
+      - NODE_ENV=development
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      node-red:
+        condition: service_started
+    volumes:
+      - ./src:/app/src
+    networks:
+      - cortex-flow-network
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: cortex-flow-postgres
+    ports:
+      - "5436:5432"
+    environment:
+      POSTGRES_DB: cortex_flow
+      POSTGRES_USER: flow
+      POSTGRES_PASSWORD: flow123
+    volumes:
+      - cortex_flow_postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flow -d cortex_flow"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - cortex-flow-network
+    restart: unless-stopped
+
+  node-red:
+    image: nodered/node-red:latest
+    container_name: cortex-flow-node-red
+    ports:
+      - "5679:1880"
+    environment:
+      - NODE_RED_ENABLE_PROJECTS=false
+      - NODE_OPTIONS=--max_old_space_size=512
+      - FLOWS=flows.json
+      - NODE_RED_CREDENTIAL_SECRET=cortex-flow-secret-change-in-production
+      - NODE_RED_SETTINGS_FILE=/config/settings.js
+    volumes:
+      - cortex_flow_node_red_data:/data
+      - ./nodered/settings.js:/data/settings.js
+    networks:
+      - cortex-flow-network
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../cortex-flow-front
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:3002
+        - NEXT_PUBLIC_APP_URL=http://localhost:3003
+    container_name: cortex-flow-frontend
+    ports:
+      - "3003:3003"
+    environment:
+      - NODE_ENV=production
+      - NEXT_PUBLIC_API_URL=http://localhost:3002
+    depends_on:
+      - api
+    networks:
+      - cortex-flow-network
+    restart: unless-stopped
+
+networks:
+  cortex-flow-network:
+    driver: bridge
+
+volumes:
+  cortex_flow_postgres_data:
+  cortex_flow_node_red_data:
