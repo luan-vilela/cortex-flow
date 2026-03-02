@@ -16,6 +16,7 @@ import {
   UpdateFlowDto,
   ExecuteFlowDto,
   SaveNodesDto,
+  ImportFlowDto,
 } from "./dto/flow.dto";
 import { WorkspaceMemberGuard } from "../../common/guards/workspace-member.guard";
 import { CurrentUser } from "../../common/decorators/current-user.decorator";
@@ -117,9 +118,12 @@ export class FlowsController {
   testFlow(
     @Param("workspaceId", ParseUUIDPipe) workspaceId: string,
     @Param("flowId", ParseUUIDPipe) flowId: string,
-    @Body() body: { inputData?: object },
+    @Body() body: Record<string, any>,
   ) {
-    return this.service.testFlow(workspaceId, flowId, body?.inputData);
+    // Aceita { inputData: {...} } ou diretamente { campo: valor, ... }
+    const inputData =
+      body && "inputData" in body ? body.inputData : (body ?? {});
+    return this.service.testFlow(workspaceId, flowId, inputData);
   }
 
   @Post(":flowId/duplicate")
@@ -174,5 +178,30 @@ export class FlowsController {
     @Param("flowId", ParseUUIDPipe) flowId: string,
   ) {
     return this.service.getWebhookInfo(workspaceId, flowId);
+  }
+
+  @Get(":flowId/export")
+  @ApiOperation({
+    summary: "Exportar flow como JSON portável (sem IDs internos)",
+  })
+  exportFlow(
+    @Param("workspaceId", ParseUUIDPipe) workspaceId: string,
+    @Param("flowId", ParseUUIDPipe) flowId: string,
+  ) {
+    return this.service.exportFlow(workspaceId, flowId);
+  }
+
+  @Post("import")
+  @RequireWorkspaceRole("admin", "operator")
+  @ApiOperation({
+    summary:
+      "Importar flow a partir de JSON exportado (cria novo flow no workspace)",
+  })
+  importFlow(
+    @Param("workspaceId", ParseUUIDPipe) workspaceId: string,
+    @Body() dto: ImportFlowDto,
+    @CurrentUser() user: any,
+  ) {
+    return this.service.importFlow(workspaceId, dto, user.sub);
   }
 }

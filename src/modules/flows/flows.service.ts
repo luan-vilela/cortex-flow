@@ -14,6 +14,7 @@ import {
   UpdateFlowDto,
   ExecuteFlowDto,
   SaveNodesDto,
+  ImportFlowDto,
 } from "./dto/flow.dto";
 import { NodeRedBridgeService } from "../node-red-bridge/node-red-bridge.service";
 import { CredentialsService } from "../credentials/credentials.service";
@@ -286,6 +287,75 @@ export class FlowsService {
       },
       userId,
     );
+  }
+
+  // ── Export / Import ──────────────────────────────────────────────────────────
+
+  /**
+   * Exporta um flow como JSON portável (sem IDs internos, sem credenciais).
+   */
+  async exportFlow(
+    workspaceId: string,
+    flowId: string,
+  ): Promise<{
+    cortexFlowVersion: string;
+    exportedAt: string;
+    flow: object;
+  }> {
+    const flow = await this.findOne(workspaceId, flowId);
+
+    return {
+      cortexFlowVersion: "1.0",
+      exportedAt: new Date().toISOString(),
+      flow: {
+        name: flow.name,
+        description: flow.description,
+        triggerType: flow.triggerType,
+        cronExpression: flow.cronExpression,
+        tags: flow.tags ?? [],
+        icon: flow.icon,
+        color: flow.color,
+        nodes: flow.nodes ?? [],
+        edges: flow.edges ?? [],
+      },
+    };
+  }
+
+  /**
+   * Importa um flow a partir de um JSON exportado por `exportFlow`.
+   * Cria um novo flow (nunca sobrescreve) e sincroniza com o Node-RED.
+   */
+  async importFlow(
+    workspaceId: string,
+    dto: ImportFlowDto,
+    userId: string,
+  ): Promise<Flow> {
+    const payload = dto.flow;
+
+    // Cria o flow base (sem nodes ainda — create só registra metadata)
+    const newFlow = await this.create(
+      workspaceId,
+      {
+        name: payload.name,
+        description: payload.description,
+        triggerType: payload.triggerType ?? "manual",
+        cronExpression: payload.cronExpression,
+        tags: payload.tags,
+        icon: payload.icon,
+        color: payload.color,
+      },
+      userId,
+    );
+
+    // Se veio com nodes, persiste e sincroniza com Node-RED
+    if (payload.nodes && payload.nodes.length > 0) {
+      return this.saveNodes(workspaceId, newFlow.id, {
+        nodes: payload.nodes,
+        edges: payload.edges ?? [],
+      });
+    }
+
+    return newFlow;
   }
 
   /**

@@ -17,8 +17,11 @@ export type CortexNodeType =
   | "emailConnectionNode"
   | "emailBodyNode"
   | "sendEmailNode"
+  | "gmailNode"
   | "webhookTriggerNode"
-  | "cronTriggerNode";
+  | "cronTriggerNode"
+  | "httpResponseNode"
+  | "httpRequestNode";
 
 export interface CortexEdge {
   id: string;
@@ -65,6 +68,16 @@ export class FlowCompilerService {
       return this.emptyFlow(flowName, tabId, p);
     }
 
+    // ── Coleta safe-ids de nós desabilitados para marcar d:true depois ───────
+    // Cada nó Cortex pode gerar N nós Node-RED; todos compartilham o mesmo
+    // sufixo "safe" (8 chars do UUID sem hífens). Marcamos d:true em todos
+    // eles após a compilação, usando o comportamento nativo do Node-RED.
+    const disabledSafeIds = new Set(
+      nodes
+        .filter((n) => n.data?.disabled === true)
+        .map((n) => n.id.replace(/-/g, "").substring(0, 8)),
+    );
+
     const metaTypes: CortexNodeType[] = [
       "emailConnectionNode",
       "emailBodyNode",
@@ -101,35 +114,57 @@ export class FlowCompilerService {
 
     // Processa sendEmailNodes primeiro, gera os nodes de ação
     for (const node of nodes) {
-      if (node.type !== "sendEmailNode") continue;
+      if (node.type !== "sendEmailNode" && node.type !== "gmailNode") continue;
 
-      const { emailConn, emailBody } = this.findEmailDeps(
-        node.id,
-        nodes,
-        edges,
-      );
+      const isGmailNode = node.type === "gmailNode";
+
+      // Para gmailNode: todos os dados vêm direto do próprio node
+      // Para sendEmailNode: busca deps (emailConnectionNode + emailBodyNode)
+      let credentialId: string;
+      let to: string;
+      let subject: string;
+      let body: string;
+      let cc: string;
+      let bcc: string;
+
+      if (isGmailNode) {
+        credentialId =
+          node.data?.gmailCredentialId || node.data?.credentialId || "";
+        to = node.data?.toEmail || "";
+        cc = node.data?.ccEmail || "";
+        bcc = node.data?.bccEmail || "";
+        subject = node.data?.subject || "";
+        body = node.data?.body || "";
+      } else {
+        const { emailConn, emailBody } = this.findEmailDeps(
+          node.id,
+          nodes,
+          edges,
+        );
+        credentialId =
+          context.gmailCredentials?.[node.id] ||
+          context.gmailCredentials?.[emailConn?.id ?? ""] ||
+          emailConn?.data?.gmailCredentialId ||
+          "";
+        to = node.data?.toEmail || "";
+        cc = "";
+        bcc = "";
+        subject = emailBody?.data?.subject || "";
+        body = emailBody?.data?.body || "";
+      }
 
       const safe = node.id.replace(/-/g, "").substring(0, 8);
 
       // ID Node-RED do function node (prefixado com p para unicidade global)
       const funcNodeId = `${p}_f_${safe}`;
 
-      // Resolve credential ID para este sendEmailNode
-      const credentialId =
-        context.gmailCredentials?.[node.id] ||
-        context.gmailCredentials?.[emailConn?.id ?? ""] ||
-        emailConn?.data?.gmailCredentialId ||
-        "";
-
-      const to = node.data?.toEmail || "";
-      const subject = emailBody?.data?.subject || "";
-      const body = emailBody?.data?.body || "";
-
       // ENV vars escopadas por node
       const envPrefix = `NR_EMAIL_${safe}`;
       envVars.push(
         { name: `${envPrefix}_CRED_ID`, value: credentialId, type: "str" },
         { name: `${envPrefix}_TO`, value: to, type: "str" },
+        { name: `${envPrefix}_CC`, value: cc, type: "str" },
+        { name: `${envPrefix}_BCC`, value: bcc, type: "str" },
         { name: `${envPrefix}_SUBJECT`, value: subject, type: "str" },
         { name: `${envPrefix}_BODY`, value: body, type: "str" },
       );
@@ -172,6 +207,97 @@ export class FlowCompilerService {
       cortexToNrId[node.id] = funcNodeId;
     }
 
+    // ── Processa httpResponseNode (nó customizado do Cortex) ────────────────
+    // Mapeia cada httpResponseNode do canvas para o nó http response do NR.
+    // Se houver body configurado, insere um function node que seta msg.payload
+    // antes de responder.
+    const cortexResponseNodes = nodes.filter(
+      (n) => n.type === "httpResponseNode",
+    );
+
+    let resolvedStatusCode = "200";
+    let resolvedBody: string | null = null;
+    let resolvedContentType = "application/json";
+
+    if (cortexResponseNodes.length > 0) {
+      const rn = cortexResponseNodes[0];
+      resolvedStatusCode = (rn.data?.statusCode as string) || "200";
+      resolvedBody = (rn.data?.body as string) || null;
+      resolvedContentType =
+        (rn.data?.contentType as string) || "application/json";
+
+      if (resolvedBody) {
+        // Insere function node que define payload e content-type antes de responder
+        const rnSafe = rn.id.replace(/-/g, "").substring(0, 8);
+        const bodyFuncId = `${p}_rbody_${rnSafe}`;
+        const envPrefixResp = `NR_RESP_${rnSafe}`;
+
+        envVars.push(
+          { name: `${envPrefixResp}_BODY`, value: resolvedBody, type: "str" },
+          {
+            name: `${envPrefixResp}_CT`,
+            value: resolvedContentType,
+            type: "str",
+          },
+        );
+
+        nrNodes.push({
+          id: bodyFuncId,
+          type: "function",
+          z: tabId,
+          name: "Montar Resposta",
+          func: `
+const render = (template, data) => {
+  if (!template) return '';
+  return template.replace(/{{\s*([a-zA-Z0-9_.()]+)\s*}}/g, (_, key) => {
+    if (key === 'all()') return JSON.stringify(data, null, 2);
+    const val = key.split('.').reduce((o, k) => (o != null ? o[k] : undefined), data);
+    return val !== undefined && val !== null ? (typeof val === 'object' ? JSON.stringify(val) : String(val)) : '';
+  });
+};
+const bodyTemplate = env.get("${envPrefixResp}_BODY");
+const ct = env.get("${envPrefixResp}_CT") || "application/json";
+const payload = msg.payload || {};
+msg.payload = render(bodyTemplate, payload);
+msg.headers = msg.headers || {};
+msg.headers["Content-Type"] = ct;
+msg.statusCode = ${resolvedStatusCode};
+return msg;
+`,
+          outputs: 1,
+          noerr: 0,
+          initialize: "",
+          finalize: "",
+          x: Math.round(rn.position.x),
+          y: Math.round(rn.position.y),
+          wires: [[httpResponseNodeId]],
+        });
+
+        cortexToNrId[rn.id] = bodyFuncId;
+      } else {
+        // Sem body: status code via function simples
+        const rnSafe = rn.id.replace(/-/g, "").substring(0, 8);
+        const statusFuncId = `${p}_rstatus_${rnSafe}`;
+
+        nrNodes.push({
+          id: statusFuncId,
+          type: "function",
+          z: tabId,
+          name: "Definir Status",
+          func: `msg.statusCode = ${resolvedStatusCode}; return msg;`,
+          outputs: 1,
+          noerr: 0,
+          initialize: "",
+          finalize: "",
+          x: Math.round(rn.position.x),
+          y: Math.round(rn.position.y),
+          wires: [[httpResponseNodeId]],
+        });
+
+        cortexToNrId[rn.id] = statusFuncId;
+      }
+    }
+
     // SEMPRE adiciona http response (responde a chamadas API/webhook;
     // é no-op quando mensagem não tem ctx HTTP — inject cron)
     nrNodes.push({
@@ -179,12 +305,216 @@ export class FlowCompilerService {
       type: "http response",
       z: tabId,
       name: "Resposta",
-      statusCode: "200",
+      statusCode: resolvedBody ? "" : resolvedStatusCode,
       headers: {},
       x: 850,
       y: 200,
       wires: [],
     });
+
+    // ── Processa httpRequestNode ─────────────────────────────────────────────
+    // Gera cadeia: [setup function] → [http request] → [post-process function]
+    // O setup function é registrado em cortexToNrId para que o trigger possa
+    // conectar a ele corretamente.
+    for (const node of nodes) {
+      if (node.type !== "httpRequestNode") continue;
+
+      const safe = node.id.replace(/-/g, "").substring(0, 8);
+      const setupFuncId = `${p}_hrf_${safe}`;
+      const httpReqNrId = `${p}_hrn_${safe}`;
+      const postProcessId = `${p}_hrp_${safe}`;
+      const envPrefix = `NR_HTTPREQ_${safe}`;
+
+      const d = node.data as Record<string, unknown>;
+      const method = ((d.method as string) || "GET").toUpperCase();
+      const url = (d.url as string) || "";
+      const authType = (d.authType as string) || "none";
+      const bearerToken = (d.bearerToken as string) || "";
+      const basicUser = (d.basicUser as string) || "";
+      const basicPassword = (d.basicPassword as string) || "";
+      const apiKeyHeader = (d.apiKeyHeader as string) || "";
+      const apiKeyValue = (d.apiKeyValue as string) || "";
+      const customHeaders: Array<{ key: string; value: string }> =
+        (d.headers as Array<{ key: string; value: string }>) || [];
+      const body = (d.body as string) || "";
+      const responseVariable = (d.responseVariable as string) || "httpResponse";
+
+      // Armazena configs como env vars para não expor segredos no código
+      envVars.push(
+        { name: `${envPrefix}_URL`, value: url, type: "str" },
+        { name: `${envPrefix}_METHOD`, value: method, type: "str" },
+        { name: `${envPrefix}_AUTH_TYPE`, value: authType, type: "str" },
+        { name: `${envPrefix}_BEARER`, value: bearerToken, type: "str" },
+        { name: `${envPrefix}_BASIC_USER`, value: basicUser, type: "str" },
+        { name: `${envPrefix}_BASIC_PASS`, value: basicPassword, type: "str" },
+        { name: `${envPrefix}_APIKEY_HDR`, value: apiKeyHeader, type: "str" },
+        { name: `${envPrefix}_APIKEY_VAL`, value: apiKeyValue, type: "str" },
+        { name: `${envPrefix}_BODY`, value: body, type: "str" },
+        {
+          name: `${envPrefix}_RESP_VAR`,
+          value: responseVariable,
+          type: "str",
+        },
+      );
+      if (customHeaders.length > 0) {
+        envVars.push({
+          name: `${envPrefix}_CUSTOM_HEADERS`,
+          value: JSON.stringify(customHeaders),
+          type: "str",
+        });
+      }
+
+      // Função de setup: prepara URL, headers, auth e body do request
+      const setupFunc = `
+const render = (template, data) => {
+  if (!template) return template == null ? '' : String(template);
+  return String(template).replace(/{{\\s*([a-zA-Z0-9_.()]+)\\s*}}/g, (_, key) => {
+    if (key === 'all()') return JSON.stringify(data, null, 2);
+    const val = key.split('.').reduce((o, k) => (o != null ? o[k] : undefined), data);
+    return val !== undefined && val !== null ? (typeof val === 'object' ? JSON.stringify(val) : String(val)) : '';
+  });
+};
+const ctx = msg.payload || {};
+
+// Salva payload anterior para restaurar pos-request
+msg._cortexCtx = ctx;
+
+const method = env.get("${envPrefix}_METHOD") || "GET";
+const rawUrl = env.get("${envPrefix}_URL") || "";
+const authType = env.get("${envPrefix}_AUTH_TYPE") || "none";
+
+msg.method = method;
+msg.url = render(rawUrl, ctx);
+
+// Reescreve URLs que apontam para o host via porta mapeada do Node-RED
+// Usa new RegExp (em vez de literal) para evitar perda de backslashes em template literals.
+msg.url = msg.url.replace(new RegExp('https?://localhost:[0-9]+/'), 'http://node-red:1880/');
+
+msg.headers = {};
+
+// Auth
+if (authType === "bearer") {
+  const token = env.get("${envPrefix}_BEARER") || "";
+  msg.headers["Authorization"] = "Bearer " + render(token, ctx);
+} else if (authType === "basic") {
+  const user = env.get("${envPrefix}_BASIC_USER") || "";
+  const pass = env.get("${envPrefix}_BASIC_PASS") || "";
+  msg.headers["Authorization"] = "Basic " + Buffer.from(render(user, ctx) + ":" + render(pass, ctx)).toString("base64");
+} else if (authType === "apikey") {
+  const hdr = env.get("${envPrefix}_APIKEY_HDR") || "";
+  const val = env.get("${envPrefix}_APIKEY_VAL") || "";
+  if (hdr) msg.headers[hdr] = render(val, ctx);
+}
+
+// Headers customizados
+const customHdrsRaw = env.get("${envPrefix}_CUSTOM_HEADERS");
+if (customHdrsRaw) {
+  try {
+    const hdrs = JSON.parse(customHdrsRaw);
+    for (const h of hdrs) {
+      if (h.key) msg.headers[h.key] = render(h.value || "", ctx);
+    }
+  } catch(e) {}
+}
+
+// Body (apenas metodos com payload)
+const bodyTpl = env.get("${envPrefix}_BODY") || "";
+const bodyMethods = ["POST", "PUT", "PATCH"];
+if (bodyMethods.includes(method) && bodyTpl) {
+  const rendered = render(bodyTpl, ctx);
+  try {
+    msg.payload = JSON.parse(rendered);
+    msg.headers["Content-Type"] = msg.headers["Content-Type"] || "application/json";
+  } catch(e) {
+    msg.payload = rendered;
+  }
+} else {
+  msg.payload = undefined;
+}
+
+return msg;
+`;
+
+      // Função pós-request: captura resposta e mescla com contexto anterior
+      const postFunc = `
+const respVar = env.get("${envPrefix}_RESP_VAR") || "httpResponse";
+const prevCtx = msg._cortexCtx || {};
+const response = {
+  status: msg.statusCode,
+  body: msg.payload,
+};
+msg.payload = Object.assign({}, prevCtx, { [respVar]: response });
+delete msg._cortexCtx;
+return msg;
+`;
+
+      // Descobre downstream do httpRequestNode (normalmente httpResponseNode)
+      const downstreamNrId = this.findDownstreamNrId(
+        node.id,
+        nodes,
+        edges,
+        metaTypes,
+        cortexToNrId,
+      );
+      const afterRequestWires = downstreamNrId
+        ? [[downstreamNrId]]
+        : [[httpResponseNodeId]];
+
+      // Nó 1: setup – prepara o request
+      nrNodes.push({
+        id: setupFuncId,
+        type: "function",
+        z: tabId,
+        name: `Preparar ${method}`,
+        func: setupFunc,
+        outputs: 1,
+        noerr: 0,
+        initialize: "",
+        finalize: "",
+        x: Math.round(node.position.x),
+        y: Math.round(node.position.y) - 60,
+        wires: [[httpReqNrId]],
+      });
+
+      // Nó 2: http request – executa a chamada HTTP
+      nrNodes.push({
+        id: httpReqNrId,
+        type: "http request",
+        z: tabId,
+        name: `${method} Request`,
+        method: method,
+        ret: "obj",
+        paytoqs: method === "GET" ? "query" : "ignore",
+        url: "{{{url}}}",
+        tls: "",
+        persist: false,
+        proxy: "",
+        insecureHTTPParser: false,
+        authType: "",
+        x: Math.round(node.position.x),
+        y: Math.round(node.position.y),
+        wires: [[postProcessId]],
+      });
+
+      // Nó 3: post-process – captura resposta no contexto do fluxo
+      nrNodes.push({
+        id: postProcessId,
+        type: "function",
+        z: tabId,
+        name: "Capturar Resposta",
+        func: postFunc,
+        outputs: 1,
+        noerr: 0,
+        initialize: "",
+        finalize: "",
+        x: Math.round(node.position.x),
+        y: Math.round(node.position.y) + 60,
+        wires: afterRequestWires,
+      });
+
+      // Registra o primeiro nó da cadeia para que nós upstream possam conectar
+      cortexToNrId[node.id] = setupFuncId;
+    }
 
     // Processa trigger node
     if (triggerNode) {
@@ -199,7 +529,11 @@ export class FlowCompilerService {
         cortexToNrId,
       );
 
-      const triggerWires = downstreamNrId ? [[downstreamNrId]] : [[]];
+      // Se não há downstream explícito, vai direto ao http response
+      // (garante que webhooks sempre respondem mesmo sem nós intermediários)
+      const triggerWires = downstreamNrId
+        ? [[downstreamNrId]]
+        : [[httpResponseNodeId]];
 
       if (isWebhook) {
         // Webhook flow: http in É o trigger principal
@@ -321,6 +655,19 @@ export class FlowCompilerService {
       });
     }
 
+    // ── Aplica d:true nos NR nodes gerados por nós Cortex desabilitados ──────
+    // Todos os NR nodes de um nó Cortex têm IDs com o padrão "*_<safe>",
+    // onde safe = primeiros 8 chars do UUID sem hífens.
+    if (disabledSafeIds.size > 0) {
+      for (const nrNode of nrNodes) {
+        const parts = nrNode.id.split("_");
+        const suffix = parts[parts.length - 1];
+        if (disabledSafeIds.has(suffix)) {
+          nrNode.d = true;
+        }
+      }
+    }
+
     // Deduplica CORTEX_API_BASE (pode aparecer múltiplas vezes)
     const seenEnv = new Set<string>();
     const dedupedEnv = envVars.filter((e) => {
@@ -426,15 +773,33 @@ const credId = env.get("${envPrefix}_CRED_ID");
 const apiBase = env.get("CORTEX_API_BASE");
 const enableUrl = env.get("GMAIL_ENABLE_URL") || "https://console.cloud.google.com/apis/library/gmail.googleapis.com";
 
-// Remove placeholders {{...}} — substituídos por dados reais do payload
-const resolveField = (envVal, payloadVal) => {
-  const v = envVal && !envVal.includes('{{') ? envVal : (payloadVal || '');
-  return v;
+// Substitui {{ variavel }} ou {{variavel}} pelos dados do payload
+const render = (template, data) => {
+  if (!template) return '';
+  return template.replace(/{{ *([a-zA-Z0-9_]+) *}}/g, (_, key) => {
+    const val = data && data[key];
+    return val !== undefined && val !== null ? String(val) : '';
+  });
 };
 
-const to = resolveField(env.get("${envPrefix}_TO"), msg.payload && msg.payload.to);
-const subject = resolveField(env.get("${envPrefix}_SUBJECT"), msg.payload && msg.payload.subject);
-const body = resolveField(env.get("${envPrefix}_BODY"), msg.payload && msg.payload.body);
+const rawPayload = (typeof msg.payload === 'object' && msg.payload !== null)
+  ? msg.payload
+  : {};
+// Desempacota inputData se o payload veio como { inputData: {...} }
+const payload = (rawPayload.inputData && typeof rawPayload.inputData === 'object')
+  ? rawPayload.inputData
+  : rawPayload;
+
+const _toTemplate = env.get("${envPrefix}_TO");
+node.warn("DEBUG raw: TO_env=" + JSON.stringify(_toTemplate) + " | payload=" + JSON.stringify(payload));
+
+const to      = render(_toTemplate,                     payload).trim();
+const cc      = render(env.get("${envPrefix}_CC"),      payload).trim();
+const bcc     = render(env.get("${envPrefix}_BCC"),     payload).trim();
+const subject = render(env.get("${envPrefix}_SUBJECT"), payload).trim();
+const body    = render(env.get("${envPrefix}_BODY"),    payload);
+
+node.warn("DEBUG cortex-flow: to=" + to + " | subject=" + subject + " | credId=" + credId + " | payloadKeys=" + Object.keys(payload).join(","));
 
 // Helper: responde com erro (sem travar o webhook HTTP)
 function fail(message, extraData) {
@@ -445,7 +810,7 @@ function fail(message, extraData) {
 }
 
 if (!credId) { return fail("Gmail credential não configurado"); }
-if (!to) { return fail("Destinatário não informado. Preencha o campo 'Para' no node ou passe { to: '...' } no payload."); }
+if (!to)     { return fail("Destinatário não informado. Preencha o campo 'Para' no node ou passe { to: '...' } no payload."); }
 
 const _fetch = global.get('fetch');
 if (!_fetch) { return fail("fetch não disponível no contexto global do Node-RED"); }
@@ -465,12 +830,16 @@ try {
 const emailLines = [
   "From: me",
   "To: " + to,
+];
+if (cc)  emailLines.push("Cc: " + cc);
+if (bcc) emailLines.push("Bcc: " + bcc);
+emailLines.push(
   "Subject: " + subject,
   "MIME-Version: 1.0",
   "Content-Type: text/html; charset=UTF-8",
   "",
   body
-];
+);
 const rawEmail = emailLines.join("\\r\\n");
 const encoded = Buffer.from(rawEmail)
   .toString("base64")

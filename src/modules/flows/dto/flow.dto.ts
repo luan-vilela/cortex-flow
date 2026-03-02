@@ -5,7 +5,9 @@ import {
   IsIn,
   IsArray,
   IsObject,
+  ValidateNested,
 } from "class-validator";
+import { Type } from "class-transformer";
 import { ApiProperty, ApiPropertyOptional, PartialType } from "@nestjs/swagger";
 
 export class CreateFlowDto {
@@ -88,4 +90,65 @@ export class ExecuteFlowDto {
   @IsOptional()
   @IsObject()
   inputData?: Record<string, any>;
+}
+
+// ── Import/Export ────────────────────────────────────────────────────────────
+
+export class ImportFlowPayloadDto {
+  @ApiProperty({ example: "Notificar novo lead" })
+  @IsString()
+  @IsNotEmpty()
+  name: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  description?: string;
+
+  @ApiPropertyOptional({ enum: ["manual", "webhook", "cron", "event"] })
+  @IsOptional()
+  @IsIn(["manual", "webhook", "cron", "event"])
+  triggerType?: "manual" | "webhook" | "cron" | "event";
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  cronExpression?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsArray()
+  tags?: string[];
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  icon?: string;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsString()
+  color?: string;
+
+  @ApiPropertyOptional({ description: "Nodes do editor visual (React Flow)" })
+  @IsOptional()
+  @IsArray()
+  nodes?: object[];
+
+  @ApiPropertyOptional({ description: "Edges do editor visual (React Flow)" })
+  @IsOptional()
+  @IsArray()
+  edges?: object[];
+}
+
+export class ImportFlowDto {
+  @ApiProperty({ example: "1.0", description: "Versão do formato de export" })
+  @IsString()
+  @IsNotEmpty()
+  cortexFlowVersion: string;
+
+  @ApiProperty({ type: () => ImportFlowPayloadDto })
+  @ValidateNested()
+  @Type(() => ImportFlowPayloadDto)
+  flow: ImportFlowPayloadDto;
 }
