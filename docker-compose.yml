@@ -44,7 +44,9 @@ services:
     restart: unless-stopped
 
   node-red:
-    image: nodered/node-red:latest
+    build:
+      context: ./nodered
+      dockerfile: Dockerfile
     container_name: cortex-flow-node-red
     ports:
       - "5679:1880"

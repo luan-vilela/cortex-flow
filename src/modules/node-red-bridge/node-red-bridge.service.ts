@@ -10,6 +10,8 @@ export interface NodeRedFlowDefinition {
   env?: Array<{ name: string; value: string; type: string }>;
   nodes: NodeRedNode[];
   configs?: NodeRedNode[];
+  /** Credenciais por nó — { nodeId: { userid, password, ... } } */
+  credentials?: Record<string, Record<string, string>>;
 }
 
 export interface NodeRedNode {
