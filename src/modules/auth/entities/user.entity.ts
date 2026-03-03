@@ -23,9 +23,9 @@ export class User {
   @Column({ name: "avatar_url", nullable: true })
   avatarUrl: string;
 
-  // SSO reference
+  // SSO reference (UUID from Cortex Control)
   @Column({ name: "crm_user_id", nullable: true })
-  crmUserId: number;
+  crmUserId: string;
 
   @Column({ name: "crm_source", nullable: true })
   crmSource: string;

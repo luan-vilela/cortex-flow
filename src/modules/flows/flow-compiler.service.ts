@@ -21,7 +21,9 @@ export type CortexNodeType =
   | "webhookTriggerNode"
   | "cronTriggerNode"
   | "httpResponseNode"
-  | "httpRequestNode";
+  | "httpRequestNode"
+  | "ifNode"
+  | "waitNode";
 
 export interface CortexEdge {
   id: string;
@@ -516,6 +518,136 @@ return msg;
       cortexToNrId[node.id] = setupFuncId;
     }
 
+    // ── Processa waitNode ──────────────────────────────────────────────────────
+    // Usa o nó nativo "delay" do Node-RED.
+    for (const node of nodes) {
+      if (node.type !== "waitNode") continue;
+
+      const safe = node.id.replace(/-/g, "").substring(0, 8);
+      const delayNodeId = `${p}_dly_${safe}`;
+
+      const seconds = Number(node.data?.seconds) || 0;
+
+      const downstreamNrId = this.findDownstreamNrId(
+        node.id,
+        nodes,
+        edges,
+        metaTypes,
+        cortexToNrId,
+      );
+      const afterWires = downstreamNrId
+        ? [[downstreamNrId]]
+        : [[httpResponseNodeId]];
+
+      nrNodes.push({
+        id: delayNodeId,
+        type: "delay",
+        z: tabId,
+        name: `Aguardar ${seconds}s`,
+        pauseType: "delay",
+        timeout: String(seconds),
+        timeoutUnits: "seconds",
+        rate: "1",
+        nbRateUnits: "1",
+        rateUnits: "second",
+        randomFirst: "1",
+        randomLast: "5",
+        randomUnits: "seconds",
+        drop: false,
+        allowrate: false,
+        outputs: 1,
+        x: Math.round(node.position.x),
+        y: Math.round(node.position.y),
+        wires: afterWires,
+      });
+
+      cortexToNrId[node.id] = delayNodeId;
+    }
+
+    // ── Processa ifNode ────────────────────────────────────────────────────────
+    // Gera um function node com 2 outputs:
+    //   output 0 → condição verdadeira (handle "true")
+    //   output 1 → condição falsa (handle "false")
+    for (const node of nodes) {
+      if (node.type !== "ifNode") continue;
+
+      const safe = node.id.replace(/-/g, "").substring(0, 8);
+      const funcNodeId = `${p}_if_${safe}`;
+      const envPrefix = `NR_IF_${safe}`;
+
+      const d = node.data as Record<string, unknown>;
+      const leftValue = (d.leftValue as string) || "";
+      const operator = (d.operator as string) || "equals";
+      const rightValue = (d.rightValue as string) || "";
+
+      envVars.push(
+        { name: `${envPrefix}_LEFT`, value: leftValue, type: "str" },
+        { name: `${envPrefix}_OP`, value: operator, type: "str" },
+        { name: `${envPrefix}_RIGHT`, value: rightValue, type: "str" },
+      );
+
+      // Descobre downstream por handle
+      const trueTarget = this.findDownstreamNrIdByHandle(
+        node.id, "true", nodes, edges, metaTypes, cortexToNrId,
+      );
+      const falseTarget = this.findDownstreamNrIdByHandle(
+        node.id, "false", nodes, edges, metaTypes, cortexToNrId,
+      );
+
+      const trueWires = trueTarget ? [trueTarget] : [];
+      const falseWires = falseTarget ? [falseTarget] : [];
+
+      const ifFunc = `
+const render = (template, data) => {
+  if (!template) return '';
+  return String(template).replace(/{{\\s*([a-zA-Z0-9_.()]+)\\s*}}/g, (_, key) => {
+    if (key === 'all()') return JSON.stringify(data, null, 2);
+    const val = key.split('.').reduce((o, k) => (o != null ? o[k] : undefined), data);
+    return val !== undefined && val !== null ? (typeof val === 'object' ? JSON.stringify(val) : String(val)) : '';
+  });
+};
+const ctx = msg.payload || {};
+const left = render(env.get("${envPrefix}_LEFT"), ctx);
+const op = env.get("${envPrefix}_OP") || "equals";
+const right = render(env.get("${envPrefix}_RIGHT"), ctx);
+
+let result = false;
+switch (op) {
+  case "equals":       result = left === right; break;
+  case "not_equals":   result = left !== right; break;
+  case "contains":     result = left.includes(right); break;
+  case "not_contains": result = !left.includes(right); break;
+  case "greater_than": result = Number(left) > Number(right); break;
+  case "less_than":    result = Number(left) < Number(right); break;
+  case "is_empty":     result = !left || left.trim() === ""; break;
+  case "is_not_empty": result = !!left && left.trim() !== ""; break;
+}
+
+if (result) {
+  return [msg, null];
+} else {
+  return [null, msg];
+}
+`;
+
+      nrNodes.push({
+        id: funcNodeId,
+        type: "function",
+        z: tabId,
+        name: "If / Condição",
+        func: ifFunc,
+        outputs: 2,
+        noerr: 0,
+        initialize: "",
+        finalize: "",
+        x: Math.round(node.position.x),
+        y: Math.round(node.position.y),
+        wires: [trueWires, falseWires],
+      });
+
+      cortexToNrId[node.id] = funcNodeId;
+    }
+
     // Processa trigger node
     if (triggerNode) {
       const safe = triggerNode.id.replace(/-/g, "").substring(0, 8);
@@ -755,6 +887,40 @@ return msg;
           metaTypes,
           cortexToNrId,
           visited,
+        );
+        if (deeper) return deeper;
+        continue;
+      }
+
+      if (cortexToNrId[targetId]) return cortexToNrId[targetId];
+    }
+
+    return null;
+  }
+
+  /**
+   * Finds the downstream Node-RED node ID for a specific sourceHandle.
+   * Used by ifNode which has "true" and "false" outputs.
+   */
+  private findDownstreamNrIdByHandle(
+    sourceId: string,
+    handleId: string,
+    nodes: CortexNode[],
+    edges: CortexEdge[],
+    metaTypes: CortexNodeType[],
+    cortexToNrId: Record<string, string>,
+  ): string | null {
+    const targets = edges
+      .filter((e) => e.source === sourceId && e.sourceHandle === handleId)
+      .map((e) => e.target);
+
+    for (const targetId of targets) {
+      const targetNode = nodes.find((n) => n.id === targetId);
+      if (!targetNode) continue;
+
+      if (metaTypes.includes(targetNode.type)) {
+        const deeper = this.findDownstreamNrId(
+          targetId, nodes, edges, metaTypes, cortexToNrId,
         );
         if (deeper) return deeper;
         continue;

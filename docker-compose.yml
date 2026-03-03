@@ -65,15 +65,18 @@ services:
     build:
       context: ../cortex-flow-front
       dockerfile: Dockerfile
-      args:
-        - NEXT_PUBLIC_API_URL=http://localhost:3002
-        - NEXT_PUBLIC_APP_URL=http://localhost:3003
+      target: development
     container_name: cortex-flow-frontend
     ports:
       - "3003:3003"
     environment:
-      - NODE_ENV=production
+      - NODE_ENV=development
       - NEXT_PUBLIC_API_URL=http://localhost:3002
+      - NEXT_PUBLIC_APP_URL=http://localhost:3003
+      - NEXT_PUBLIC_CRM_URL=http://localhost:3001
+    volumes:
+      - ../cortex-flow-front/src:/app/src
+      - ../cortex-flow-front/public:/app/public
     depends_on:
       - api
     networks:

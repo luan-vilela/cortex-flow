@@ -18,8 +18,8 @@ CREATE TABLE IF NOT EXISTS users (
   email VARCHAR(255) NOT NULL UNIQUE,
   password_hash VARCHAR(255),
   avatar_url TEXT,
-  -- SSO from Cortex Control
-  crm_user_id INTEGER,
+  -- SSO from Cortex Control (UUID)
+  crm_user_id VARCHAR(255),
   crm_source VARCHAR(50),
   -- Status
   is_active BOOLEAN NOT NULL DEFAULT true,
